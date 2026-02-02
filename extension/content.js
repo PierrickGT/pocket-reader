@@ -8,10 +8,8 @@ const SERVER_URL = 'http://localhost:5050';
 
 // Audio playback state
 let audioContext = null;
-let currentAudioSource = null;
-let currentAudioBuffer = null;
-let audioStartTime = 0;
-let audioPauseTime = 0;
+let currentAudioElement = null;
+let currentAudioUrl = null;
 let shouldStop = false;
 let isPaused = false;
 let playbackSpeed = 1.0;
@@ -19,8 +17,8 @@ let currentParagraphIndex = 0;
 let totalParagraphs = 0;
 
 // Selection reading state (separate from main page reading)
-let selectionAudioContext = null;
-let selectionAudioSource = null;
+let selectionAudioElement = null;
+let selectionAudioUrl = null;
 let isReadingSelection = false;
 
 /**
@@ -36,12 +34,7 @@ function getAudioContext() {
 /**
  * Get or create the selection audio context
  */
-function getSelectionAudioContext() {
-  if (!selectionAudioContext) {
-    selectionAudioContext = new (window.AudioContext || window.webkitAudioContext)();
-  }
-  return selectionAudioContext;
-}
+
 
 // DOM element tracking for highlighting
 let readableElements = []; // Array of DOM elements that can be read
@@ -299,69 +292,93 @@ function notifyExtension(message) {
  * Also accepts an optional onTimeUpdate callback for prefetch timing
  */
 async function playAudioBlob(audioBlob, onReadyToPrefetch) {
-  return new Promise(async (resolve, reject) => {
-    if (shouldStop) {
-      resolve({ stopped: true });
-      return;
-    }
-
-    try {
-      const context = getAudioContext();
-
-      // Convert blob to ArrayBuffer
-      const arrayBuffer = await audioBlob.arrayBuffer();
-
-      // Decode audio data
-      const audioBuffer = await context.decodeAudioData(arrayBuffer);
-
+  return new Promise((resolve, reject) => {
+    (async () => {
       if (shouldStop) {
         resolve({ stopped: true });
         return;
       }
 
-      // Store buffer for pause/resume
-      currentAudioBuffer = audioBuffer;
+      try {
+        const audioUrl = URL.createObjectURL(audioBlob);
+        const audio = new Audio();
+        audio.src = audioUrl;
+        audio.preload = 'auto';
+        audio.playbackRate = playbackSpeed;
+        audio.preservesPitch = true;
+        audio.mozPreservesPitch = true;
+        audio.webkitPreservesPitch = true;
 
-      // Create source node
-      const source = context.createBufferSource();
-      source.buffer = audioBuffer;
-      source.playbackRate.value = playbackSpeed;
-      source.connect(context.destination);
+        currentAudioElement = audio;
+        currentAudioUrl = audioUrl;
 
-      currentAudioSource = source;
+        let prefetchTimer = null;
+        let settled = false;
 
-      let prefetchTriggered = false;
-      const duration = audioBuffer.duration;
+        const cleanup = () => {
+          if (prefetchTimer) {
+            clearTimeout(prefetchTimer);
+          }
+          if (currentAudioUrl === audioUrl) {
+            currentAudioUrl = null;
+          }
+          if (currentAudioElement === audio) {
+            currentAudioElement = null;
+          }
+          URL.revokeObjectURL(audioUrl);
+        };
 
-      // Set up prefetch timer (at 70% of duration)
-      const prefetchTime = (duration / playbackSpeed) * 0.7 * 1000;
-      const prefetchTimer = setTimeout(() => {
-        prefetchTriggered = true;
-        if (onReadyToPrefetch) {
-          onReadyToPrefetch();
-        }
-      }, prefetchTime);
+        const settle = (result) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve(result);
+        };
 
-      // Handle completion
-      source.onended = () => {
-        clearTimeout(prefetchTimer);
-        currentAudioSource = null;
-        currentAudioBuffer = null;
-        if (!shouldStop) {
-          resolve({ stopped: false });
-        }
-      };
+        const fail = (error) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          reject(error);
+        };
 
-      // Start playback
-      audioStartTime = context.currentTime;
-      audioPauseTime = 0;
-      source.start(0);
+        const setupPrefetchTimer = () => {
+          if (!Number.isFinite(audio.duration) || audio.duration <= 0) return;
+          const prefetchTime = (audio.duration / playbackSpeed) * 0.7 * 1000;
+          prefetchTimer = setTimeout(() => {
+            if (onReadyToPrefetch) {
+              onReadyToPrefetch();
+            }
+          }, prefetchTime);
+        };
 
-    } catch (error) {
-      currentAudioSource = null;
-      currentAudioBuffer = null;
-      reject(error);
-    }
+        audio.addEventListener('loadedmetadata', setupPrefetchTimer, { once: true });
+
+        // Handle completion
+        audio.onended = () => {
+          if (!shouldStop) {
+            settle({ stopped: false });
+          }
+        };
+
+        audio.onpause = () => {
+          if (shouldStop) {
+            settle({ stopped: true });
+          }
+        };
+
+        audio.onerror = () => {
+          fail(new Error('Audio playback failed'));
+        };
+
+        // Start playback
+        getAudioContext();
+        await audio.play();
+
+      } catch (error) {
+        reject(error);
+      }
+    })();
   });
 }
 
@@ -561,18 +578,24 @@ function stopPlayback() {
   shouldStop = true;
   isPaused = false;
 
-  if (currentAudioSource) {
+  const audioElement = currentAudioElement;
+  const audioUrl = currentAudioUrl;
+  currentAudioElement = null;
+  currentAudioUrl = null;
+
+  if (audioElement) {
     try {
-      currentAudioSource.stop();
+      audioElement.pause();
+      audioElement.currentTime = 0;
     } catch (e) {
-      // Source might already be stopped
+      // Ignore
     }
-    currentAudioSource = null;
+  }
+  if (audioUrl) {
+    URL.revokeObjectURL(audioUrl);
   }
 
-  currentAudioBuffer = null;
-  audioStartTime = 0;
-  audioPauseTime = 0;
+
 
   // Remove highlight
   removeHighlight();
@@ -584,17 +607,12 @@ function stopPlayback() {
  * Pause audio playback
  */
 function pausePlayback() {
-  if (currentAudioSource && !isPaused && audioContext) {
-    // Calculate how far we are into the audio
-    audioPauseTime = audioContext.currentTime - audioStartTime;
-
+  if (currentAudioElement && !isPaused) {
     try {
-      currentAudioSource.stop();
+      currentAudioElement.pause();
     } catch (e) {
-      // Source might already be stopped
+      // Ignore
     }
-    currentAudioSource = null;
-
     isPaused = true;
     notifyExtension({ action: 'paused' });
   }
@@ -604,22 +622,10 @@ function pausePlayback() {
  * Resume audio playback
  */
 async function resumePlayback() {
-  if (isPaused && currentAudioBuffer && audioContext) {
+  if (isPaused && currentAudioElement) {
     try {
-      // Create new source from the same buffer
-      const source = audioContext.createBufferSource();
-      source.buffer = currentAudioBuffer;
-      source.playbackRate.value = playbackSpeed;
-      source.connect(audioContext.destination);
-
-      currentAudioSource = source;
-
-      // Resume from where we paused (accounting for playback speed)
-      const offset = audioPauseTime * playbackSpeed;
-      audioStartTime = audioContext.currentTime - audioPauseTime;
-
-      source.start(0, offset);
-
+      currentAudioElement.playbackRate = playbackSpeed;
+      await currentAudioElement.play();
       isPaused = false;
       notifyExtension({ action: 'resumed' });
     } catch (error) {
@@ -635,13 +641,19 @@ async function resumePlayback() {
 function stopSelectionReading() {
   isReadingSelection = false;
 
-  if (selectionAudioSource) {
+  if (selectionAudioElement) {
     try {
-      selectionAudioSource.stop();
+      selectionAudioElement.pause();
+      selectionAudioElement.currentTime = 0;
     } catch (e) {
       // Source might already be stopped
     }
-    selectionAudioSource = null;
+    selectionAudioElement = null;
+  }
+
+  if (selectionAudioUrl) {
+    URL.revokeObjectURL(selectionAudioUrl);
+    selectionAudioUrl = null;
   }
 }
 
@@ -668,36 +680,40 @@ async function speakSelection(voice, speed) {
 
     if (!isReadingSelection) return; // Stopped while synthesizing
 
-    // Create and play audio using Web Audio API to bypass CSP restrictions
-    const context = getSelectionAudioContext();
+    const audioUrl = URL.createObjectURL(audioBlob);
+    const audio = new Audio();
+    audio.src = audioUrl;
+    audio.preload = 'auto';
+    audio.playbackRate = speed;
+    audio.preservesPitch = true;
+    audio.mozPreservesPitch = true;
+    audio.webkitPreservesPitch = true;
 
-    // Convert blob to ArrayBuffer
-    const arrayBuffer = await audioBlob.arrayBuffer();
+    selectionAudioElement = audio;
+    selectionAudioUrl = audioUrl;
 
-    // Decode audio data
-    const audioBuffer = await context.decodeAudioData(arrayBuffer);
-
-    if (!isReadingSelection) return; // Stopped while decoding
-
-    // Create source node
-    const source = context.createBufferSource();
-    source.buffer = audioBuffer;
-    source.playbackRate.value = speed;
-    source.connect(context.destination);
-
-    selectionAudioSource = source;
-
-    source.onended = () => {
-      selectionAudioSource = null;
+    audio.onended = () => {
+      selectionAudioElement = null;
+      if (selectionAudioUrl) {
+        URL.revokeObjectURL(selectionAudioUrl);
+        selectionAudioUrl = null;
+      }
       isReadingSelection = false;
     };
 
-    // Start playback
-    source.start(0);
+    audio.onerror = () => {
+      selectionAudioElement = null;
+      if (selectionAudioUrl) {
+        URL.revokeObjectURL(selectionAudioUrl);
+        selectionAudioUrl = null;
+      }
+      isReadingSelection = false;
+    };
+
+    await audio.play();
 
   } catch (error) {
     isReadingSelection = false;
-    selectionAudio = null;
     console.error('Error speaking selection:', error);
 
     if (error.message.includes('Failed to fetch') || error.message.includes('NetworkError')) {
@@ -786,15 +802,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ status: 'resumed' });
   } else if (message.action === 'setSpeed') {
     playbackSpeed = message.speed;
-    if (currentAudioSource) {
-      currentAudioSource.playbackRate.value = playbackSpeed;
+    if (currentAudioElement) {
+      currentAudioElement.playbackRate = playbackSpeed;
     }
     sendResponse({ status: 'speed_set', speed: playbackSpeed });
   } else if (message.action === 'getPlaybackState') {
     sendResponse({
-      isPlaying: currentAudioSource !== null && !isPaused,
+      isPlaying: currentAudioElement !== null && !isPaused,
       isPaused: isPaused,
-      isStopped: currentAudioSource === null
+      isStopped: currentAudioElement === null
     });
   } else if (message.action === 'getSavedPosition') {
     const url = getNormalizedUrl();
