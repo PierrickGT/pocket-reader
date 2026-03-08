@@ -35,7 +35,6 @@ function getAudioContext() {
  * Get or create the selection audio context
  */
 
-
 // DOM element tracking for highlighting
 let readableElements = []; // Array of DOM elements that can be read
 let currentHighlightedElement = null;
@@ -49,7 +48,7 @@ const HIGHLIGHT_STYLE_ID = 'pocket-reader-styles';
  */
 function injectHighlightStyles() {
   if (document.getElementById(HIGHLIGHT_STYLE_ID)) return;
-  
+
   const style = document.createElement('style');
   style.id = HIGHLIGHT_STYLE_ID;
   style.textContent = `
@@ -72,11 +71,11 @@ function highlightElement(element) {
   if (currentHighlightedElement) {
     currentHighlightedElement.classList.remove(HIGHLIGHT_CLASS);
   }
-  
+
   if (element) {
     element.classList.add(HIGHLIGHT_CLASS);
     currentHighlightedElement = element;
-    
+
     // Scroll element into view smoothly
     element.scrollIntoView({
       behavior: 'smooth',
@@ -101,6 +100,7 @@ function removeHighlight() {
  */
 function findContentContainer() {
   const selectors = [
+    '[data-testid="twitterArticleReadView"]',
     'article',
     '[role="main"]',
     'main',
@@ -111,7 +111,7 @@ function findContentContainer() {
     '#content',
     '.story-body',
     '.article-body',
-    '.post-body',
+    '.post-body'
   ];
 
   for (const selector of selectors) {
@@ -130,21 +130,30 @@ function findContentContainer() {
 function isExcludedElement(element) {
   const excludedTags = ['SCRIPT', 'STYLE', 'NOSCRIPT', 'IFRAME', 'NAV', 'HEADER', 'FOOTER', 'ASIDE'];
   if (excludedTags.includes(element.tagName)) return true;
-  
+
   const excludedClasses = [
-    'sidebar', 'navigation', 'menu', 'comments', 'comment',
-    'advertisement', 'ad', 'ads', 'social-share', 'share-buttons',
-    'related-posts', 'recommended'
+    'sidebar',
+    'navigation',
+    'menu',
+    'comments',
+    'comment',
+    'advertisement',
+    'ad',
+    'ads',
+    'social-share',
+    'share-buttons',
+    'related-posts',
+    'recommended'
   ];
-  
-  const classList = Array.from(element.classList).map(c => c.toLowerCase());
-  if (excludedClasses.some(exc => classList.includes(exc))) return true;
-  
+
+  const classList = Array.from(element.classList).map((c) => c.toLowerCase());
+  if (excludedClasses.some((exc) => classList.includes(exc))) return true;
+
   const role = element.getAttribute('role');
   if (['navigation', 'banner', 'complementary'].includes(role)) return true;
-  
+
   if (element.getAttribute('aria-hidden') === 'true') return true;
-  
+
   return false;
 }
 
@@ -153,10 +162,9 @@ function isExcludedElement(element) {
  */
 function isVisible(element) {
   const style = window.getComputedStyle(element);
-  return style.display !== 'none' && 
-         style.visibility !== 'hidden' && 
-         style.opacity !== '0' &&
-         element.offsetParent !== null;
+  return (
+    style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' && element.offsetParent !== null
+  );
 }
 
 /**
@@ -166,12 +174,13 @@ function isVisible(element) {
 function extractReadableElements() {
   const container = findContentContainer();
   const elements = [];
-  
+
   // Selectors for readable content blocks
-  const readableSelectors = 'p, h1, h2, h3, h4, h5, h6, li, blockquote, figcaption, td, th, dt, dd, pre';
-  
+  const readableSelectors =
+    '[data-testid="twitter-article-title"], [data-text="true"], p, h1, h2, h3, h4, h5, h6, li, blockquote, figcaption, td, th, dt, dd, pre';
+
   const candidates = container.querySelectorAll(readableSelectors);
-  
+
   for (const element of candidates) {
     // Skip if inside an excluded parent
     let parent = element.parentElement;
@@ -184,37 +193,37 @@ function extractReadableElements() {
       parent = parent.parentElement;
     }
     if (excluded) continue;
-    
+
     // Skip if element itself is excluded
     if (isExcludedElement(element)) continue;
-    
+
     // Skip if not visible
     if (!isVisible(element)) continue;
-    
+
     // Get text content
     const text = (element.innerText || element.textContent || '').trim();
-    
+
     // Skip empty or very short elements
     if (text.length < 10) continue;
-    
+
     // Skip if this element's text is entirely contained in a child we'll process later
     // (avoid reading the same content twice)
     const childReadables = element.querySelectorAll(readableSelectors);
     if (childReadables.length > 0) {
       const childText = Array.from(childReadables)
-        .map(c => (c.innerText || '').trim())
+        .map((c) => (c.innerText || '').trim())
         .join('');
       if (childText.length >= text.length * 0.9) {
         continue; // Skip parent, children will cover the content
       }
     }
-    
+
     elements.push({
       element: element,
       text: text
     });
   }
-  
+
   return elements;
 }
 
@@ -224,14 +233,14 @@ function extractReadableElements() {
  */
 function extractMainContent() {
   const elements = extractReadableElements();
-  const texts = elements.map(e => e.text);
-  
+  const texts = elements.map((e) => e.text);
+
   // Prepend title
   const title = getPageTitle();
   if (title) {
     texts.unshift(title);
   }
-  
+
   return texts.join('\n\n');
 }
 
@@ -352,7 +361,9 @@ async function playAudioBlob(audioBlob, onReadyToPrefetch) {
           }, prefetchTime);
         };
 
-        audio.addEventListener('loadedmetadata', setupPrefetchTimer, { once: true });
+        audio.addEventListener('loadedmetadata', setupPrefetchTimer, {
+          once: true
+        });
 
         // Handle completion
         audio.onended = () => {
@@ -374,7 +385,6 @@ async function playAudioBlob(audioBlob, onReadyToPrefetch) {
         // Start playback
         getAudioContext();
         await audio.play();
-
       } catch (error) {
         reject(error);
       }
@@ -389,7 +399,7 @@ async function synthesizeParagraph(text, voice) {
   const response = await fetch(`${SERVER_URL}/synthesize`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, voice }),
+    body: JSON.stringify({ text, voice })
   });
 
   if (!response.ok) {
@@ -407,7 +417,7 @@ async function getParagraphs(text) {
   const response = await fetch(`${SERVER_URL}/paragraphs`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify({ text })
   });
 
   if (!response.ok) {
@@ -445,15 +455,15 @@ async function readParagraphsFromIndex(paragraphs, voice, startIndex = 0, speed 
     notifyExtension({
       action: 'progress',
       percent: 10,
-      text: `Reading from paragraph ${startIndex + 1}/${total}...`,
+      text: `Reading from paragraph ${startIndex + 1}/${total}...`
     });
 
     // Cache for prefetched audio blobs
     const prefetchedAudio = new Map();
 
     // Get text from paragraph (handles both string and object formats)
-    const getText = (para) => typeof para === 'string' ? para : para.text;
-    
+    const getText = (para) => (typeof para === 'string' ? para : para.text);
+
     // Get element for highlighting
     const getElement = (para) => {
       if (typeof para === 'object' && para.elementIndex !== undefined) {
@@ -493,7 +503,7 @@ async function readParagraphsFromIndex(paragraphs, voice, startIndex = 0, speed 
         notifyExtension({
           action: 'progress',
           percent: progressPercent,
-          text: `Generating ${i + 1}/${total}...`,
+          text: `Generating ${i + 1}/${total}...`
         });
         audioBlob = await synthesizeParagraph(getText(paragraphs[i]), voice);
       }
@@ -512,9 +522,9 @@ async function readParagraphsFromIndex(paragraphs, voice, startIndex = 0, speed 
       notifyExtension({
         action: 'playing',
         current: i + 1,
-        total: total,
+        total: total
       });
-      
+
       // Save current position for this URL
       saveReadingPosition(i, total);
 
@@ -558,7 +568,11 @@ async function readText(text, voice, speed = 1.0) {
   playbackSpeed = speed;
 
   try {
-    notifyExtension({ action: 'progress', percent: 5, text: 'Splitting into paragraphs...' });
+    notifyExtension({
+      action: 'progress',
+      percent: 5,
+      text: 'Splitting into paragraphs...'
+    });
 
     const paragraphs = await getParagraphs(text);
 
@@ -594,8 +608,6 @@ function stopPlayback() {
   if (audioUrl) {
     URL.revokeObjectURL(audioUrl);
   }
-
-
 
   // Remove highlight
   removeHighlight();
@@ -711,7 +723,6 @@ async function speakSelection(voice, speed) {
     };
 
     await audio.play();
-
   } catch (error) {
     isReadingSelection = false;
     console.error('Error speaking selection:', error);
@@ -741,26 +752,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         text: fullText,
         title: title,
         url: window.location.href,
-        length: fullText.length,
+        length: fullText.length
       });
     } catch (error) {
       console.error('Error extracting content:', error);
       sendResponse({
         success: false,
-        error: error.message,
+        error: error.message
       });
     }
   } else if (message.action === 'scanElements') {
     // Extract readable elements and store references for highlighting
     try {
       readableElements = extractReadableElements();
-      
+
       // Return just the text for each element (we keep element refs locally)
       const paragraphs = readableElements.map((item, index) => ({
         text: item.text,
         elementIndex: index
       }));
-      
+
       sendResponse({
         success: true,
         paragraphs: paragraphs,
@@ -780,13 +791,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   } else if (message.action === 'readParagraphs') {
     // Read pre-scanned paragraphs from a specific index
     // Check if paragraphs have elementIndex (for highlighting)
-    const useHighlighting = message.paragraphs.length > 0 && 
-                            typeof message.paragraphs[0] === 'object' && 
-                            message.paragraphs[0].elementIndex !== undefined;
+    const useHighlighting =
+      message.paragraphs.length > 0 &&
+      typeof message.paragraphs[0] === 'object' &&
+      message.paragraphs[0].elementIndex !== undefined;
     readParagraphsFromIndex(
-      message.paragraphs, 
-      message.voice, 
-      message.startIndex || 0, 
+      message.paragraphs,
+      message.voice,
+      message.startIndex || 0,
       message.speed || 1.0,
       useHighlighting
     );
