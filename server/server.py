@@ -23,6 +23,18 @@ _voice_states = {}
 AVAILABLE_VOICES = ["alba", "marius", "javert", "jean", "fantine", "cosette", "eponine", "azelma"]
 
 
+SMART_QUOTE_MAP = str.maketrans({
+    "\u201c": '"',
+    "\u201d": '"',
+    "\u2018": "'",
+    "\u2019": "'",
+    "\u201e": '"',
+    "\u201f": '"',
+    "\u2032": "'",
+    "\u2033": '"',
+})
+
+
 def get_model():
     """Lazy load the TTS model."""
     global _tts_model
@@ -83,6 +95,11 @@ def split_into_paragraphs(text: str) -> list[str]:
     return result if result else [text]
 
 
+def normalize_smart_quotes(text: str) -> str:
+    """Replace smart quotes with straight quotes."""
+    return text.translate(SMART_QUOTE_MAP)
+
+
 def audio_to_wav_bytes(audio_tensor, sample_rate: int) -> bytes:
     """Convert audio tensor to WAV bytes."""
     audio_np = audio_tensor.numpy()
@@ -141,6 +158,7 @@ def get_paragraphs():
     if not text.strip():
         return jsonify({"error": "Text cannot be empty"}), 400
     
+    text = normalize_smart_quotes(text)
     paragraphs = split_into_paragraphs(text)
     
     return jsonify({
@@ -172,6 +190,8 @@ def synthesize():
     
     if not text.strip():
         return jsonify({"error": "Text cannot be empty"}), 400
+
+    text = normalize_smart_quotes(text)
     
     if voice not in AVAILABLE_VOICES:
         voice = 'alba'
