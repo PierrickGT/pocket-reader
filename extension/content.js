@@ -1,7 +1,7 @@
 /**
  * Pocket Reader - Content Script
  * Extracts main content from web pages and handles audio playback
- * Uses prefetching to generate next paragraph while current one plays
+ * Uses streaming-first synthesis with fallback for resilient playback
  */
 
 const SERVER_URL = 'http://localhost:5050';
@@ -15,11 +15,13 @@ let isPaused = false;
 let playbackSpeed = 1.0;
 let currentParagraphIndex = 0;
 let totalParagraphs = 0;
+let mainStreamAbortController = null;
 
 // Selection reading state (separate from main page reading)
 let selectionAudioElement = null;
 let selectionAudioUrl = null;
 let isReadingSelection = false;
+let selectionStreamAbortController = null;
 
 /**
  * Get or create the audio context
@@ -411,6 +413,101 @@ async function synthesizeParagraph(text, voice) {
 }
 
 /**
+ * Stream-first playback for one paragraph, with fallback to /synthesize
+ */
+async function playParagraphStreamFirst(text, voice) {
+  const chunkQueue = [];
+  let streamComplete = false;
+  let streamError = null;
+  let queueResolver = null;
+  let hasPlayedAnyStreamChunk = false;
+  const abortController = new AbortController();
+  mainStreamAbortController = abortController;
+
+  const enqueueChunk = (chunkBlob) => {
+    if (queueResolver) {
+      const resolve = queueResolver;
+      queueResolver = null;
+      resolve(chunkBlob);
+    } else {
+      chunkQueue.push(chunkBlob);
+    }
+  };
+
+  const finishQueue = () => {
+    streamComplete = true;
+    if (queueResolver) {
+      const resolve = queueResolver;
+      queueResolver = null;
+      resolve(null);
+    }
+  };
+
+  const getNextChunk = async () => {
+    if (chunkQueue.length > 0) {
+      return chunkQueue.shift();
+    }
+    if (streamComplete) {
+      return null;
+    }
+    return new Promise((resolve) => {
+      queueResolver = resolve;
+    });
+  };
+
+  const streamTask = streamSelectionAudio(text, voice, enqueueChunk, abortController.signal)
+    .catch((error) => {
+      streamError = error;
+    })
+    .finally(() => {
+      finishQueue();
+    });
+
+  try {
+    while (!shouldStop) {
+      const nextChunk = await getNextChunk();
+      if (!nextChunk) break;
+
+      try {
+        const playResult = await playAudioBlob(nextChunk);
+        if (playResult.stopped || shouldStop) {
+          break;
+        }
+        hasPlayedAnyStreamChunk = true;
+      } catch (playbackError) {
+        if (!hasPlayedAnyStreamChunk) {
+          streamError = playbackError;
+          break;
+        }
+        throw playbackError;
+      }
+    }
+
+    await streamTask;
+
+    if (streamError && streamError.name !== 'AbortError') {
+      if (!hasPlayedAnyStreamChunk) {
+        console.warn('Paragraph streaming failed before playback; falling back to /synthesize:', streamError);
+        const fallbackBlob = await synthesizeParagraph(text, voice);
+
+        if (shouldStop) {
+          return { stopped: true };
+        }
+
+        return await playAudioBlob(fallbackBlob);
+      }
+      throw streamError;
+    }
+
+    return { stopped: shouldStop };
+  } finally {
+    if (mainStreamAbortController === abortController) {
+      mainStreamAbortController = null;
+    }
+  }
+}
+
+/**
  * Get paragraphs from server
  */
 async function getParagraphs(text) {
@@ -429,7 +526,7 @@ async function getParagraphs(text) {
 }
 
 /**
- * Read paragraphs with prefetching, starting from a specific index
+ * Read paragraphs with streaming-first playback, starting from a specific index
  * @param {Array} paragraphs - Array of paragraph texts OR objects with {text, elementIndex}
  * @param {string} voice - Voice to use
  * @param {number} startIndex - Index to start reading from (0-based)
@@ -458,9 +555,6 @@ async function readParagraphsFromIndex(paragraphs, voice, startIndex = 0, speed 
       text: `Reading from paragraph ${startIndex + 1}/${total}...`
     });
 
-    // Cache for prefetched audio blobs
-    const prefetchedAudio = new Map();
-
     // Get text from paragraph (handles both string and object formats)
     const getText = (para) => (typeof para === 'string' ? para : para.text);
 
@@ -472,21 +566,6 @@ async function readParagraphsFromIndex(paragraphs, voice, startIndex = 0, speed 
       return null;
     };
 
-    // Function to prefetch a paragraph
-    const prefetchNext = (index) => {
-      if (index < paragraphs.length && !prefetchedAudio.has(index) && !shouldStop) {
-        synthesizeParagraph(getText(paragraphs[index]), voice)
-          .then((blob) => {
-            if (!shouldStop) {
-              prefetchedAudio.set(index, blob);
-            }
-          })
-          .catch((err) => {
-            console.warn(`Prefetch failed for paragraph ${index}:`, err);
-          });
-      }
-    };
-
     for (let i = startIndex; i < paragraphs.length; i++) {
       if (shouldStop) break;
 
@@ -494,19 +573,11 @@ async function readParagraphsFromIndex(paragraphs, voice, startIndex = 0, speed 
 
       const progressPercent = 10 + Math.floor(((i - startIndex) / remaining) * 80);
 
-      // Check if we have prefetched audio, otherwise generate it
-      let audioBlob;
-      if (prefetchedAudio.has(i)) {
-        audioBlob = prefetchedAudio.get(i);
-        prefetchedAudio.delete(i);
-      } else {
-        notifyExtension({
-          action: 'progress',
-          percent: progressPercent,
-          text: `Generating ${i + 1}/${total}...`
-        });
-        audioBlob = await synthesizeParagraph(getText(paragraphs[i]), voice);
-      }
+      notifyExtension({
+        action: 'progress',
+        percent: progressPercent,
+        text: `Generating ${i + 1}/${total}...`
+      });
 
       if (shouldStop) break;
 
@@ -528,18 +599,8 @@ async function readParagraphsFromIndex(paragraphs, voice, startIndex = 0, speed 
       // Save current position for this URL
       saveReadingPosition(i, total);
 
-      // Start prefetching next paragraph immediately when we start playing
-      if (i + 1 < paragraphs.length) {
-        prefetchNext(i + 1);
-      }
-
-      // Play the audio, with a callback to prefetch even further ahead at 70%
-      const result = await playAudioBlob(audioBlob, () => {
-        // When 70% through, start prefetching the one after next
-        if (i + 2 < paragraphs.length) {
-          prefetchNext(i + 2);
-        }
-      });
+      // Stream paragraph chunks as they arrive, with fallback to /synthesize.
+      const result = await playParagraphStreamFirst(getText(paragraphs[i]), voice);
 
       if (result.stopped || shouldStop) break;
     }
@@ -591,6 +652,11 @@ async function readText(text, voice, speed = 1.0) {
 function stopPlayback() {
   shouldStop = true;
   isPaused = false;
+
+  if (mainStreamAbortController) {
+    mainStreamAbortController.abort();
+    mainStreamAbortController = null;
+  }
 
   const audioElement = currentAudioElement;
   const audioUrl = currentAudioUrl;
@@ -653,6 +719,11 @@ async function resumePlayback() {
 function stopSelectionReading() {
   isReadingSelection = false;
 
+  if (selectionStreamAbortController) {
+    selectionStreamAbortController.abort();
+    selectionStreamAbortController = null;
+  }
+
   if (selectionAudioElement) {
     try {
       selectionAudioElement.pause();
@@ -670,12 +741,156 @@ function stopSelectionReading() {
 }
 
 /**
+ * Decode base64 audio into a Blob
+ */
+function base64ToAudioBlob(base64Audio) {
+  const binaryString = atob(base64Audio);
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return new Blob([bytes], { type: 'audio/wav' });
+}
+
+/**
+ * Play one selection chunk and resolve when finished
+ */
+async function playSelectionChunk(audioBlob, speed) {
+  return new Promise((resolve, reject) => {
+    (async () => {
+      if (!isReadingSelection) {
+        resolve({ stopped: true });
+        return;
+      }
+
+      const audioUrl = URL.createObjectURL(audioBlob);
+      const audio = new Audio();
+      audio.src = audioUrl;
+      audio.preload = 'auto';
+      audio.playbackRate = speed;
+      audio.preservesPitch = true;
+      audio.mozPreservesPitch = true;
+      audio.webkitPreservesPitch = true;
+
+      selectionAudioElement = audio;
+      selectionAudioUrl = audioUrl;
+
+      let settled = false;
+      const cleanup = () => {
+        if (selectionAudioElement === audio) {
+          selectionAudioElement = null;
+        }
+        if (selectionAudioUrl === audioUrl) {
+          selectionAudioUrl = null;
+        }
+        URL.revokeObjectURL(audioUrl);
+      };
+
+      const settle = (result) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(result);
+      };
+
+      const fail = (error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+
+      audio.onended = () => settle({ stopped: false });
+      audio.onpause = () => {
+        if (!isReadingSelection) {
+          settle({ stopped: true });
+        }
+      };
+      audio.onerror = () => {
+        const mediaError = audio.error;
+        const code = mediaError ? mediaError.code : 'unknown';
+        fail(new Error(`Selection audio playback failed (code: ${code})`));
+      };
+
+      try {
+        await audio.play();
+      } catch (error) {
+        fail(error);
+      }
+    })().catch((error) => reject(error));
+  });
+}
+
+/**
+ * Stream synthesized selection audio chunks from server
+ */
+async function streamSelectionAudio(text, voice, onChunk, abortSignal) {
+  const response = await fetch(`${SERVER_URL}/synthesize-stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, voice }),
+    signal: abortSignal
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error.error || 'Streaming synthesis failed');
+  }
+
+  if (!response.body) {
+    throw new Error('Streaming response is not supported by this browser');
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  const handleLine = (line) => {
+    if (!line) return;
+
+    const payload = JSON.parse(line);
+    if (payload.type === 'chunk' && payload.audio) {
+      onChunk(base64ToAudioBlob(payload.audio));
+      return;
+    }
+
+    if (payload.type === 'error') {
+      throw new Error(payload.error || 'Streaming synthesis failed');
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+
+    let newlineIndex = buffer.indexOf('\n');
+    while (newlineIndex !== -1) {
+      const line = buffer.slice(0, newlineIndex).trim();
+      buffer = buffer.slice(newlineIndex + 1);
+      handleLine(line);
+      newlineIndex = buffer.indexOf('\n');
+    }
+  }
+
+  buffer += decoder.decode();
+  const trailingLine = buffer.trim();
+  if (trailingLine) {
+    handleLine(trailingLine);
+  }
+}
+
+/**
  * Speak selected text using context menu
  */
 async function speakSelection(voice, speed) {
+  let selectedText = '';
+  let hasPlayedAnyStreamChunk = false;
+
   try {
     // Get selected text
-    const selectedText = window.getSelection().toString().trim();
+    selectedText = window.getSelection().toString().trim();
 
     if (!selectedText) {
       alert('No text selected');
@@ -687,50 +902,116 @@ async function speakSelection(voice, speed) {
 
     isReadingSelection = true;
 
-    // Synthesize the selected text
-    const audioBlob = await synthesizeParagraph(selectedText, voice);
+    selectionStreamAbortController = new AbortController();
 
-    if (!isReadingSelection) return; // Stopped while synthesizing
+    // Async queue of chunks as they stream in.
+    const chunkQueue = [];
+    let streamComplete = false;
+    let streamError = null;
+    let queueResolver = null;
 
-    const audioUrl = URL.createObjectURL(audioBlob);
-    const audio = new Audio();
-    audio.src = audioUrl;
-    audio.preload = 'auto';
-    audio.playbackRate = speed;
-    audio.preservesPitch = true;
-    audio.mozPreservesPitch = true;
-    audio.webkitPreservesPitch = true;
-
-    selectionAudioElement = audio;
-    selectionAudioUrl = audioUrl;
-
-    audio.onended = () => {
-      selectionAudioElement = null;
-      if (selectionAudioUrl) {
-        URL.revokeObjectURL(selectionAudioUrl);
-        selectionAudioUrl = null;
+    const enqueueChunk = (chunkBlob) => {
+      if (queueResolver) {
+        const resolve = queueResolver;
+        queueResolver = null;
+        resolve(chunkBlob);
+      } else {
+        chunkQueue.push(chunkBlob);
       }
-      isReadingSelection = false;
     };
 
-    audio.onerror = () => {
-      selectionAudioElement = null;
-      if (selectionAudioUrl) {
-        URL.revokeObjectURL(selectionAudioUrl);
-        selectionAudioUrl = null;
+    const finishQueue = () => {
+      streamComplete = true;
+      if (queueResolver) {
+        const resolve = queueResolver;
+        queueResolver = null;
+        resolve(null);
       }
-      isReadingSelection = false;
     };
 
-    await audio.play();
+    const getNextChunk = async () => {
+      if (chunkQueue.length > 0) {
+        return chunkQueue.shift();
+      }
+      if (streamComplete) {
+        return null;
+      }
+      return new Promise((resolve) => {
+        queueResolver = resolve;
+      });
+    };
+
+    const streamTask = streamSelectionAudio(
+      selectedText,
+      voice,
+      enqueueChunk,
+      selectionStreamAbortController.signal
+    )
+      .catch((error) => {
+        streamError = error;
+      })
+      .finally(() => {
+        finishQueue();
+      });
+
+    while (isReadingSelection) {
+      const nextChunk = await getNextChunk();
+
+      if (!nextChunk) {
+        break;
+      }
+
+      try {
+        const playResult = await playSelectionChunk(nextChunk, speed);
+        if (playResult.stopped) {
+          break;
+        }
+        hasPlayedAnyStreamChunk = true;
+      } catch (playbackError) {
+        if (!hasPlayedAnyStreamChunk) {
+          // If we fail before any stream audio played, use full synth fallback.
+          streamError = playbackError;
+          break;
+        }
+
+        // Skip failed chunks once streaming playback has already started.
+        console.warn('Selection chunk playback failed, skipping chunk:', playbackError);
+      }
+    }
+
+    await streamTask;
+
+    if (streamError && streamError.name !== 'AbortError') {
+      if (!hasPlayedAnyStreamChunk) {
+        console.warn('Selection streaming failed before playback; falling back to /synthesize:', streamError);
+        const fallbackBlob = await synthesizeParagraph(selectedText, voice);
+
+        if (!isReadingSelection) {
+          return;
+        }
+
+        await playSelectionChunk(fallbackBlob, speed);
+        return;
+      }
+
+      throw streamError;
+    }
   } catch (error) {
-    isReadingSelection = false;
+    if (error.name === 'AbortError') {
+      return;
+    }
+
     console.error('Error speaking selection:', error);
 
     if (error.message.includes('Failed to fetch') || error.message.includes('NetworkError')) {
       alert('Could not connect to TTS server. Make sure the server is running at http://localhost:5050');
     } else {
       alert('Error: ' + error.message);
+    }
+  } finally {
+    isReadingSelection = false;
+    if (selectionStreamAbortController) {
+      selectionStreamAbortController = null;
     }
   }
 }

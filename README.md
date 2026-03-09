@@ -108,6 +108,7 @@ The TTS server provides the following endpoints:
 | `/voices` | GET | List available voices |
 | `/paragraphs` | POST | Split text into paragraphs |
 | `/synthesize` | POST | Convert text to speech |
+| `/synthesize-stream` | POST | Stream synthesized speech chunks (NDJSON) |
 | `/preload` | POST | Preload model and voices |
 
 ### Example: Synthesize Text

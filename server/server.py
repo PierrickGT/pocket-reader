@@ -6,8 +6,10 @@ Supports streaming audio and multiple voices.
 """
 
 import io
+import json
 import re
 import wave
+import base64
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import numpy as np
@@ -118,6 +120,40 @@ def audio_to_wav_bytes(audio_tensor, sample_rate: int) -> bytes:
     return buffer.read()
 
 
+def split_for_streaming(text: str, max_chars: int = 320) -> list[str]:
+    """Split text into speech-friendly chunks for streaming delivery."""
+    paragraphs = split_into_paragraphs(text)
+    chunks = []
+
+    for paragraph in paragraphs:
+        if len(paragraph) <= max_chars:
+            chunks.append(paragraph)
+            continue
+
+        sentences = re.split(r'(?<=[.!?])\s+', paragraph)
+        current = []
+        current_len = 0
+
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+
+            sentence_len = len(sentence)
+            if current and current_len + sentence_len + 1 > max_chars:
+                chunks.append(" ".join(current))
+                current = [sentence]
+                current_len = sentence_len
+            else:
+                current.append(sentence)
+                current_len += sentence_len + (1 if current_len else 0)
+
+        if current:
+            chunks.append(" ".join(current))
+
+    return chunks if chunks else [text]
+
+
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint."""
@@ -217,6 +253,61 @@ def synthesize():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/synthesize-stream', methods=['POST'])
+def synthesize_stream():
+    """
+    Stream synthesized text as newline-delimited JSON chunks.
+
+    Request body:
+    {
+        "text": "Text to synthesize",
+        "voice": "alba"  # optional, defaults to "alba"
+    }
+
+    Response stream (application/x-ndjson):
+    {"type":"chunk","index":0,"audio":"<base64 wav bytes>"}
+    {"type":"done","count":1}
+    """
+    data = request.get_json()
+
+    if not data or 'text' not in data:
+        return jsonify({"error": "Missing 'text' field"}), 400
+
+    text = data['text']
+    voice = data.get('voice', 'alba')
+
+    if not text.strip():
+        return jsonify({"error": "Text cannot be empty"}), 400
+
+    text = normalize_smart_quotes(text)
+
+    if voice not in AVAILABLE_VOICES:
+        voice = 'alba'
+
+    def generate_stream():
+        try:
+            model = get_model()
+            voice_state = get_voice_state(voice)
+            chunks = split_for_streaming(text)
+
+            for index, chunk in enumerate(chunks):
+                audio = model.generate_audio(voice_state, chunk)
+                wav_bytes = audio_to_wav_bytes(audio, model.sample_rate)
+                payload = {
+                    "type": "chunk",
+                    "index": index,
+                    "audio": base64.b64encode(wav_bytes).decode('ascii')
+                }
+                yield json.dumps(payload) + "\n"
+
+            yield json.dumps({"type": "done", "count": len(chunks)}) + "\n"
+        except Exception as e:
+            print(f"Error streaming speech: {e}")
+            yield json.dumps({"type": "error", "error": str(e)}) + "\n"
+
+    return Response(generate_stream(), mimetype='application/x-ndjson')
+
+
 @app.route('/preload', methods=['POST'])
 def preload():
     """
@@ -256,6 +347,7 @@ def main():
     print("  GET  /voices      - List available voices")
     print("  POST /paragraphs  - Split text into paragraphs")
     print("  POST /synthesize  - Convert text to speech")
+    print("  POST /synthesize-stream - Stream text as chunked speech")
     print("  POST /preload     - Preload model and voices")
     print("\nServer running at http://localhost:5050")
     

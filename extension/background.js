@@ -176,27 +176,26 @@ chrome.runtime.onInstalled.addListener(() => {
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === 'speakSelection') {
     try {
-      // Ensure content script is loaded
+      // Get saved preferences
+      const { voice, speed } = await chrome.storage.local.get(['voice', 'speed']);
+
+      const speakSelectionMessage = {
+        action: 'speakSelection',
+        voice: voice || 'alba',
+        speed: speed || 1.0
+      };
+
       try {
+        // First try messaging the content script loaded from manifest.
+        await chrome.tabs.sendMessage(tab.id, speakSelectionMessage);
+      } catch (sendError) {
+        // On pages where the script isn't attached yet, inject then retry once.
         await chrome.scripting.executeScript({
           target: { tabId: tab.id },
           files: ['content.js']
         });
-      } catch (e) {
-        // Script might already be loaded
+        await chrome.tabs.sendMessage(tab.id, speakSelectionMessage);
       }
-
-      // Get saved preferences
-      const { voice, speed } = await chrome.storage.local.get(['voice', 'speed']);
-
-      // Send message to content script to speak selection
-      chrome.tabs.sendMessage(tab.id, {
-        action: 'speakSelection',
-        voice: voice || 'alba',
-        speed: speed || 1.0
-      }).catch((error) => {
-        console.error('Error sending speakSelection message:', error);
-      });
     } catch (error) {
       console.error('Error handling context menu click:', error);
     }
