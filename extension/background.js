@@ -73,52 +73,19 @@ async function startReadingFromShortcut(tab) {
       // Script might already be loaded
     }
 
-    // Scan for readable elements (with DOM references for highlighting)
-    const response = await new Promise((resolve, reject) => {
-      chrome.tabs.sendMessage(tab.id, { action: 'scanElements' }, (resp) => {
-        if (chrome.runtime.lastError) {
-          reject(new Error('Could not access page'));
-        } else {
-          resolve(resp);
-        }
-      });
-    });
-
-    if (!response || !response.success || !response.paragraphs) {
-      console.error('Could not scan page content');
-      return;
-    }
-
-    const paragraphs = response.paragraphs;
-
-    // Get saved preferences
     const { voice, speed } = await chrome.storage.local.get(['voice', 'speed']);
 
-    // Check for saved position
-    const savedPosition = await new Promise((resolve) => {
-      chrome.tabs.sendMessage(tab.id, { action: 'getSavedPosition' }, (resp) => {
-        if (chrome.runtime.lastError) {
-          resolve(null);
-        } else {
-          resolve(resp);
-        }
+    activeTabId = tab.id;
+    chrome.tabs.sendMessage(tab.id, { action: 'extractContent' }, (response) => {
+      if (chrome.runtime.lastError || !response || !response.text) return;
+
+      chrome.tabs.sendMessage(tab.id, {
+        action: 'readText',
+        text: response.text,
+        voice: voice || 'alba',
+        speed: speed || 1.0
       });
     });
-
-    const startIndex = (savedPosition && savedPosition.index > 0 && savedPosition.index < paragraphs.length) 
-      ? savedPosition.index 
-      : 0;
-
-    // Start reading with highlighting enabled
-    activeTabId = tab.id;
-    chrome.tabs.sendMessage(tab.id, {
-      action: 'readParagraphs',
-      paragraphs: paragraphs,
-      startIndex: startIndex,
-      voice: voice || 'alba',
-      speed: speed || 1.0
-    });
-
   } catch (error) {
     console.error('Error starting reading from shortcut:', error);
   }
@@ -140,13 +107,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     case 'startReading':
       activeTabId = message.tabId;
       // Forward to content script
-      chrome.tabs.sendMessage(message.tabId, {
-        action: 'readText',
-        text: message.text,
-        voice: message.voice,
-      }).catch((error) => {
-        console.error('Error sending to content script:', error);
-      });
+      chrome.tabs
+        .sendMessage(message.tabId, {
+          action: 'readText',
+          text: message.text,
+          voice: message.voice
+        })
+        .catch((error) => {
+          console.error('Error sending to content script:', error);
+        });
       sendResponse({ status: 'started' });
       break;
 

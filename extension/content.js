@@ -1,7 +1,7 @@
 /**
  * Pocket Reader - Content Script
  * Extracts main content from web pages and handles audio playback
- * Uses streaming-first synthesis with fallback for resilient playback
+ * Compiles all paragraphs into a single audio file before playing
  */
 
 const SERVER_URL = 'http://localhost:5050';
@@ -13,9 +13,8 @@ let currentAudioUrl = null;
 let shouldStop = false;
 let isPaused = false;
 let playbackSpeed = 1.0;
-let currentParagraphIndex = 0;
-let totalParagraphs = 0;
-let mainStreamAbortController = null;
+let mainAbortController = null;
+let playbackTimeUpdateInterval = null;
 
 // Selection reading state (separate from main page reading)
 let selectionAudioElement = null;
@@ -31,70 +30,6 @@ function getAudioContext() {
     audioContext = new (window.AudioContext || window.webkitAudioContext)();
   }
   return audioContext;
-}
-
-/**
- * Get or create the selection audio context
- */
-
-// DOM element tracking for highlighting
-let readableElements = []; // Array of DOM elements that can be read
-let currentHighlightedElement = null;
-
-// CSS class for highlighting
-const HIGHLIGHT_CLASS = 'pocket-reader-highlight';
-const HIGHLIGHT_STYLE_ID = 'pocket-reader-styles';
-
-/**
- * Inject highlight styles into the page
- */
-function injectHighlightStyles() {
-  if (document.getElementById(HIGHLIGHT_STYLE_ID)) return;
-
-  const style = document.createElement('style');
-  style.id = HIGHLIGHT_STYLE_ID;
-  style.textContent = `
-    .${HIGHLIGHT_CLASS} {
-      background-color: rgba(99, 102, 241, 0.15) !important;
-      outline: 2px solid rgba(99, 102, 241, 0.5) !important;
-      outline-offset: 2px !important;
-      border-radius: 4px !important;
-      transition: background-color 0.2s ease, outline 0.2s ease !important;
-    }
-  `;
-  document.head.appendChild(style);
-}
-
-/**
- * Highlight a specific element
- */
-function highlightElement(element) {
-  // Remove previous highlight
-  if (currentHighlightedElement) {
-    currentHighlightedElement.classList.remove(HIGHLIGHT_CLASS);
-  }
-
-  if (element) {
-    element.classList.add(HIGHLIGHT_CLASS);
-    currentHighlightedElement = element;
-
-    // Scroll element into view smoothly
-    element.scrollIntoView({
-      behavior: 'smooth',
-      block: 'center',
-      inline: 'nearest'
-    });
-  }
-}
-
-/**
- * Remove all highlights
- */
-function removeHighlight() {
-  if (currentHighlightedElement) {
-    currentHighlightedElement.classList.remove(HIGHLIGHT_CLASS);
-    currentHighlightedElement = null;
-  }
 }
 
 /**
@@ -178,14 +113,12 @@ function extractReadableElements() {
   const container = findContentContainer();
   const elements = [];
 
-  // Selectors for readable content blocks
   const readableSelectors =
     '[data-testid="twitter-article-title"], [data-testid="tweetText"], [data-text="true"], p, h1, h2, h3, h4, h5, h6, li, blockquote, figcaption, td, th, dt, dd, pre';
 
   const candidates = container.querySelectorAll(readableSelectors);
 
   for (const element of candidates) {
-    // Skip if inside an excluded parent
     let parent = element.parentElement;
     let excluded = false;
     while (parent && parent !== container) {
@@ -197,27 +130,19 @@ function extractReadableElements() {
     }
     if (excluded) continue;
 
-    // Skip if element itself is excluded
     if (isExcludedElement(element)) continue;
-
-    // Skip if not visible
     if (!isVisible(element)) continue;
 
-    // Get text content
     const text = (element.innerText || element.textContent || '').trim();
-
-    // Skip empty or very short elements
     if (text.length < 10) continue;
 
-    // Skip if this element's text is entirely contained in a child we'll process later
-    // (avoid reading the same content twice)
     const childReadables = element.querySelectorAll(readableSelectors);
     if (childReadables.length > 0) {
       const childText = Array.from(childReadables)
         .map((c) => (c.innerText || '').trim())
         .join('');
       if (childText.length >= text.length * 0.9) {
-        continue; // Skip parent, children will cover the content
+        continue;
       }
     }
 
@@ -231,14 +156,12 @@ function extractReadableElements() {
 }
 
 /**
- * Extract the main readable content from the page (legacy, for text-only extraction)
- * Uses various heuristics to find the main article/content area
+ * Extract the main readable content from the page
  */
 function extractMainContent() {
   const elements = extractReadableElements();
   const texts = elements.map((e) => e.text);
 
-  // Prepend title
   const title = getPageTitle();
   if (title) {
     texts.unshift(title);
@@ -294,20 +217,115 @@ function clearReadingPosition() {
  * Send message to popup/background
  */
 function notifyExtension(message) {
-  chrome.runtime.sendMessage(message).catch(() => {
-    // Extension context might be invalid, ignore
-  });
+  chrome.runtime.sendMessage(message).catch(() => {});
 }
 
 /**
- * Play audio from blob using Web Audio API to bypass CSP restrictions
- * Also accepts an optional onTimeUpdate callback for prefetch timing
+ * Start sending time-based progress updates to the popup while playing
  */
-async function playAudioBlob(audioBlob, onReadyToPrefetch) {
+function startTimeUpdates() {
+  stopTimeUpdates();
+  playbackTimeUpdateInterval = setInterval(() => {
+    if (!currentAudioElement || shouldStop || isPaused) return;
+
+    const duration = currentAudioElement.duration;
+    const currentTime = currentAudioElement.currentTime;
+    if (!Number.isFinite(duration) || duration <= 0) return;
+
+    const percent = 10 + Math.floor((currentTime / duration) * 80);
+    const remaining = Math.max(0, (duration - currentTime) / playbackSpeed);
+    const mins = Math.floor(remaining / 60);
+    const secs = Math.floor(remaining % 60);
+    const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+
+    notifyExtension({
+      action: 'progress',
+      percent: percent,
+      text: `Playing... ${timeStr} left`
+    });
+  }, 1000);
+}
+
+function stopTimeUpdates() {
+  if (playbackTimeUpdateInterval) {
+    clearInterval(playbackTimeUpdateInterval);
+    playbackTimeUpdateInterval = null;
+  }
+}
+
+/**
+ * Compile all text into a single audio file via the server, then play it.
+ * @param {string} text - Full text to compile and play
+ * @param {string} voice - Voice to use
+ * @param {number} speed - Playback speed multiplier
+ */
+async function compileAndPlay(text, voice, speed = 1.0) {
+  shouldStop = false;
+  isPaused = false;
+  playbackSpeed = speed;
+  mainAbortController = new AbortController();
+
+  try {
+    notifyExtension({
+      action: 'compiling'
+    });
+
+    notifyExtension({
+      action: 'progress',
+      percent: 5,
+      text: 'Compiling audio...'
+    });
+
+    const response = await fetch(`${SERVER_URL}/synthesize-full`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, voice }),
+      signal: mainAbortController.signal
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.error || 'Server error');
+    }
+
+    if (shouldStop) return;
+
+    const audioBlob = await response.blob();
+
+    if (shouldStop) return;
+
+    notifyExtension({
+      action: 'progress',
+      percent: 10,
+      text: 'Playing audio...'
+    });
+
+    await playCompiledAudio(audioBlob);
+
+    if (!shouldStop) {
+      clearReadingPosition();
+      notifyExtension({ action: 'complete' });
+    }
+  } catch (error) {
+    if (error.name === 'AbortError') return;
+    console.error('TTS error:', error);
+    notifyExtension({ action: 'error', text: error.message });
+  } finally {
+    stopTimeUpdates();
+    if (mainAbortController) {
+      mainAbortController = null;
+    }
+  }
+}
+
+/**
+ * Play a compiled audio blob from start to finish
+ */
+async function playCompiledAudio(audioBlob) {
   return new Promise((resolve, reject) => {
     (async () => {
       if (shouldStop) {
-        resolve({ stopped: true });
+        resolve();
         return;
       }
 
@@ -324,13 +342,10 @@ async function playAudioBlob(audioBlob, onReadyToPrefetch) {
         currentAudioElement = audio;
         currentAudioUrl = audioUrl;
 
-        let prefetchTimer = null;
         let settled = false;
 
         const cleanup = () => {
-          if (prefetchTimer) {
-            clearTimeout(prefetchTimer);
-          }
+          stopTimeUpdates();
           if (currentAudioUrl === audioUrl) {
             currentAudioUrl = null;
           }
@@ -354,30 +369,15 @@ async function playAudioBlob(audioBlob, onReadyToPrefetch) {
           reject(error);
         };
 
-        const setupPrefetchTimer = () => {
-          if (!Number.isFinite(audio.duration) || audio.duration <= 0) return;
-          const prefetchTime = (audio.duration / playbackSpeed) * 0.7 * 1000;
-          prefetchTimer = setTimeout(() => {
-            if (onReadyToPrefetch) {
-              onReadyToPrefetch();
-            }
-          }, prefetchTime);
-        };
-
-        audio.addEventListener('loadedmetadata', setupPrefetchTimer, {
-          once: true
-        });
-
-        // Handle completion
         audio.onended = () => {
           if (!shouldStop) {
-            settle({ stopped: false });
+            settle();
           }
         };
 
         audio.onpause = () => {
           if (shouldStop) {
-            settle({ stopped: true });
+            settle();
           }
         };
 
@@ -385,9 +385,9 @@ async function playAudioBlob(audioBlob, onReadyToPrefetch) {
           fail(new Error('Audio playback failed'));
         };
 
-        // Start playback
         getAudioContext();
         await audio.play();
+        startTimeUpdates();
       } catch (error) {
         reject(error);
       }
@@ -396,255 +396,13 @@ async function playAudioBlob(audioBlob, onReadyToPrefetch) {
 }
 
 /**
- * Synthesize a single paragraph - returns a promise for the audio blob
- */
-async function synthesizeParagraph(text, voice) {
-  const response = await fetch(`${SERVER_URL}/synthesize`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, voice })
-  });
-
-  if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.error || 'Server error');
-  }
-
-  return await response.blob();
-}
-
-/**
- * Stream-first playback for one paragraph, with fallback to /synthesize
- */
-async function playParagraphStreamFirst(text, voice) {
-  const chunkQueue = [];
-  let streamComplete = false;
-  let streamError = null;
-  let queueResolver = null;
-  let hasPlayedAnyStreamChunk = false;
-  const abortController = new AbortController();
-  mainStreamAbortController = abortController;
-
-  const enqueueChunk = (chunkBlob) => {
-    if (queueResolver) {
-      const resolve = queueResolver;
-      queueResolver = null;
-      resolve(chunkBlob);
-    } else {
-      chunkQueue.push(chunkBlob);
-    }
-  };
-
-  const finishQueue = () => {
-    streamComplete = true;
-    if (queueResolver) {
-      const resolve = queueResolver;
-      queueResolver = null;
-      resolve(null);
-    }
-  };
-
-  const getNextChunk = async () => {
-    if (chunkQueue.length > 0) {
-      return chunkQueue.shift();
-    }
-    if (streamComplete) {
-      return null;
-    }
-    return new Promise((resolve) => {
-      queueResolver = resolve;
-    });
-  };
-
-  const streamTask = streamSelectionAudio(text, voice, enqueueChunk, abortController.signal)
-    .catch((error) => {
-      streamError = error;
-    })
-    .finally(() => {
-      finishQueue();
-    });
-
-  try {
-    while (!shouldStop) {
-      const nextChunk = await getNextChunk();
-      if (!nextChunk) break;
-
-      try {
-        const playResult = await playAudioBlob(nextChunk);
-        if (playResult.stopped || shouldStop) {
-          break;
-        }
-        hasPlayedAnyStreamChunk = true;
-      } catch (playbackError) {
-        if (!hasPlayedAnyStreamChunk) {
-          streamError = playbackError;
-          break;
-        }
-        throw playbackError;
-      }
-    }
-
-    await streamTask;
-
-    if (streamError && streamError.name !== 'AbortError') {
-      if (!hasPlayedAnyStreamChunk) {
-        console.warn('Paragraph streaming failed before playback; falling back to /synthesize:', streamError);
-        const fallbackBlob = await synthesizeParagraph(text, voice);
-
-        if (shouldStop) {
-          return { stopped: true };
-        }
-
-        return await playAudioBlob(fallbackBlob);
-      }
-      throw streamError;
-    }
-
-    return { stopped: shouldStop };
-  } finally {
-    if (mainStreamAbortController === abortController) {
-      mainStreamAbortController = null;
-    }
-  }
-}
-
-/**
- * Get paragraphs from server
- */
-async function getParagraphs(text) {
-  const response = await fetch(`${SERVER_URL}/paragraphs`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text })
-  });
-
-  if (!response.ok) {
-    throw new Error('Failed to split text into paragraphs');
-  }
-
-  const data = await response.json();
-  return data.paragraphs;
-}
-
-/**
- * Read paragraphs with streaming-first playback, starting from a specific index
- * @param {Array} paragraphs - Array of paragraph texts OR objects with {text, elementIndex}
- * @param {string} voice - Voice to use
- * @param {number} startIndex - Index to start reading from (0-based)
- * @param {number} speed - Playback speed multiplier
- * @param {boolean} useHighlighting - Whether to highlight elements during reading
- */
-async function readParagraphsFromIndex(paragraphs, voice, startIndex = 0, speed = 1.0, useHighlighting = false) {
-  shouldStop = false;
-  isPaused = false;
-  playbackSpeed = speed;
-  totalParagraphs = paragraphs.length;
-  currentParagraphIndex = startIndex;
-
-  // Inject highlight styles if we're using highlighting
-  if (useHighlighting) {
-    injectHighlightStyles();
-  }
-
-  const total = paragraphs.length;
-  const remaining = total - startIndex;
-
-  try {
-    notifyExtension({
-      action: 'progress',
-      percent: 10,
-      text: `Reading from paragraph ${startIndex + 1}/${total}...`
-    });
-
-    // Get text from paragraph (handles both string and object formats)
-    const getText = (para) => (typeof para === 'string' ? para : para.text);
-
-    // Get element for highlighting
-    const getElement = (para) => {
-      if (typeof para === 'object' && para.elementIndex !== undefined) {
-        return readableElements[para.elementIndex]?.element;
-      }
-      return null;
-    };
-
-    for (let i = startIndex; i < paragraphs.length; i++) {
-      if (shouldStop) break;
-
-      currentParagraphIndex = i;
-
-      const progressPercent = 10 + Math.floor(((i - startIndex) / remaining) * 80);
-
-      notifyExtension({
-        action: 'progress',
-        percent: progressPercent,
-        text: `Generating ${i + 1}/${total}...`
-      });
-
-      if (shouldStop) break;
-
-      // Highlight the current element if available
-      if (useHighlighting) {
-        const element = getElement(paragraphs[i]);
-        if (element) {
-          highlightElement(element);
-        }
-      }
-
-      // Notify that we're playing and save position
-      notifyExtension({
-        action: 'playing',
-        current: i + 1,
-        total: total
-      });
-
-      // Save current position for this URL
-      saveReadingPosition(i, total);
-
-      // Stream paragraph chunks as they arrive, with fallback to /synthesize.
-      const result = await playParagraphStreamFirst(getText(paragraphs[i]), voice);
-
-      if (result.stopped || shouldStop) break;
-    }
-
-    // Remove highlight when done
-    removeHighlight();
-
-    if (!shouldStop) {
-      // Clear saved position when finished
-      clearReadingPosition();
-      notifyExtension({ action: 'complete' });
-    }
-  } catch (error) {
-    removeHighlight();
-    console.error('TTS error:', error);
-    notifyExtension({ action: 'error', text: error.message });
-  }
-}
-
-/**
- * Process and read text - extracts paragraphs first
+ * Process and read text - sends directly to compile-then-play
  */
 async function readText(text, voice, speed = 1.0) {
   shouldStop = false;
   isPaused = false;
   playbackSpeed = speed;
-
-  try {
-    notifyExtension({
-      action: 'progress',
-      percent: 5,
-      text: 'Splitting into paragraphs...'
-    });
-
-    const paragraphs = await getParagraphs(text);
-
-    if (shouldStop) return;
-
-    await readParagraphsFromIndex(paragraphs, voice, 0, speed);
-  } catch (error) {
-    console.error('TTS error:', error);
-    notifyExtension({ action: 'error', text: error.message });
-  }
+  await compileAndPlay(text, voice, speed);
 }
 
 /**
@@ -653,10 +411,11 @@ async function readText(text, voice, speed = 1.0) {
 function stopPlayback() {
   shouldStop = true;
   isPaused = false;
+  stopTimeUpdates();
 
-  if (mainStreamAbortController) {
-    mainStreamAbortController.abort();
-    mainStreamAbortController = null;
+  if (mainAbortController) {
+    mainAbortController.abort();
+    mainAbortController = null;
   }
 
   const audioElement = currentAudioElement;
@@ -676,9 +435,6 @@ function stopPlayback() {
     URL.revokeObjectURL(audioUrl);
   }
 
-  // Remove highlight
-  removeHighlight();
-
   notifyExtension({ action: 'stopped' });
 }
 
@@ -693,6 +449,7 @@ function pausePlayback() {
       // Ignore
     }
     isPaused = true;
+    stopTimeUpdates();
     notifyExtension({ action: 'paused' });
   }
 }
@@ -706,6 +463,7 @@ async function resumePlayback() {
       currentAudioElement.playbackRate = playbackSpeed;
       await currentAudioElement.play();
       isPaused = false;
+      startTimeUpdates();
       notifyExtension({ action: 'resumed' });
     } catch (error) {
       console.error('Resume playback error:', error);
@@ -751,6 +509,24 @@ function base64ToAudioBlob(base64Audio) {
     bytes[i] = binaryString.charCodeAt(i);
   }
   return new Blob([bytes], { type: 'audio/wav' });
+}
+
+/**
+ * Synthesize a single text blob - returns a promise for the audio blob
+ */
+async function synthesizeParagraph(text, voice) {
+  const response = await fetch(`${SERVER_URL}/synthesize`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, voice })
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.error || 'Server error');
+  }
+
+  return await response.blob();
 }
 
 /**
@@ -883,14 +659,13 @@ async function streamSelectionAudio(text, voice, onChunk, abortSignal) {
 }
 
 /**
- * Speak selected text using context menu
+ * Speak selected text using context menu (still uses streaming for low latency)
  */
 async function speakSelection(voice, speed) {
   let selectedText = '';
   let hasPlayedAnyStreamChunk = false;
 
   try {
-    // Get selected text
     selectedText = window.getSelection().toString().trim();
 
     if (!selectedText) {
@@ -898,14 +673,12 @@ async function speakSelection(voice, speed) {
       return;
     }
 
-    // Stop any previous selection audio
     stopSelectionReading();
 
     isReadingSelection = true;
 
     selectionStreamAbortController = new AbortController();
 
-    // Async queue of chunks as they stream in.
     const chunkQueue = [];
     let streamComplete = false;
     let streamError = null;
@@ -965,12 +738,10 @@ async function speakSelection(voice, speed) {
         hasPlayedAnyStreamChunk = true;
       } catch (playbackError) {
         if (!hasPlayedAnyStreamChunk) {
-          // If we fail before any stream audio played, use full synth fallback.
           streamError = playbackError;
           break;
         }
 
-        // Skip failed chunks once streaming playback has already started.
         console.warn('Selection chunk playback failed, skipping chunk:', playbackError);
       }
     }
@@ -1021,7 +792,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const text = extractMainContent();
       const title = getPageTitle();
 
-      // Prepend title if available
       const fullText = title ? `${title}. ${text}` : text;
 
       sendResponse({
@@ -1038,47 +808,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         error: error.message
       });
     }
-  } else if (message.action === 'scanElements') {
-    // Extract readable elements and store references for highlighting
-    try {
-      readableElements = extractReadableElements();
-
-      // Return just the text for each element (we keep element refs locally)
-      const paragraphs = readableElements.map((item, index) => ({
-        text: item.text,
-        elementIndex: index
-      }));
-
-      sendResponse({
-        success: true,
-        paragraphs: paragraphs,
-        count: paragraphs.length
-      });
-    } catch (error) {
-      console.error('Error scanning elements:', error);
-      sendResponse({
-        success: false,
-        error: error.message
-      });
-    }
   } else if (message.action === 'readText') {
-    // Read text from the beginning (extracts paragraphs internally)
     readText(message.text, message.voice, message.speed || 1.0);
-    sendResponse({ status: 'started' });
-  } else if (message.action === 'readParagraphs') {
-    // Read pre-scanned paragraphs from a specific index
-    // Check if paragraphs have elementIndex (for highlighting)
-    const useHighlighting =
-      message.paragraphs.length > 0 &&
-      typeof message.paragraphs[0] === 'object' &&
-      message.paragraphs[0].elementIndex !== undefined;
-    readParagraphsFromIndex(
-      message.paragraphs,
-      message.voice,
-      message.startIndex || 0,
-      message.speed || 1.0,
-      useHighlighting
-    );
     sendResponse({ status: 'started' });
   } else if (message.action === 'stop') {
     stopPlayback();
@@ -1107,7 +838,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const positions = result.readingPositions || {};
       sendResponse(positions[url] || null);
     });
-    return true; // Async response
+    return true;
   } else if (message.action === 'clearSavedPosition') {
     clearReadingPosition();
     sendResponse({ status: 'cleared' });
@@ -1116,9 +847,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ status: 'started' });
   }
 
-  // Return true to indicate async response
   return true;
 });
 
-// Log that content script is loaded
 console.log('Pocket Reader content script loaded');

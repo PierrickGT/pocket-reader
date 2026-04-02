@@ -120,6 +120,44 @@ def audio_to_wav_bytes(audio_tensor, sample_rate: int) -> bytes:
     return buffer.read()
 
 
+def concatenate_wav_bytes(wav_chunks: list[bytes], silence_duration: float = 0.3) -> bytes:
+    """Concatenate multiple WAV byte buffers into a single WAV with silence gaps."""
+    if not wav_chunks:
+        raise ValueError("No audio chunks to concatenate")
+
+    all_frames = []
+    sample_rate = None
+    sample_width = None
+    n_channels = None
+
+    silence_added = False
+    for chunk in wav_chunks:
+        buffer = io.BytesIO(chunk)
+        with wave.open(buffer, 'rb') as wf:
+            if sample_rate is None:
+                sample_rate = wf.getframerate()
+                sample_width = wf.getsampwidth()
+                n_channels = wf.getnchannels()
+            frames = wf.readframes(wf.getnframes())
+            all_frames.append(frames)
+
+        if not silence_added and len(wav_chunks) > 1:
+            silence_samples = int(sample_rate * silence_duration)
+            silence_frames = b'\x00' * (silence_samples * sample_width * n_channels)
+            all_frames.append(silence_frames)
+            silence_added = True
+
+    out_buffer = io.BytesIO()
+    with wave.open(out_buffer, 'wb') as out_wf:
+        out_wf.setnchannels(n_channels)
+        out_wf.setsampwidth(sample_width)
+        out_wf.setframerate(sample_rate)
+        out_wf.writeframes(b''.join(all_frames))
+
+    out_buffer.seek(0)
+    return out_buffer.read()
+
+
 def split_for_streaming(text: str, max_chars: int = 320) -> list[str]:
     """Split text into speech-friendly chunks for streaming delivery."""
     paragraphs = split_into_paragraphs(text)
@@ -308,6 +346,65 @@ def synthesize_stream():
     return Response(generate_stream(), mimetype='application/x-ndjson')
 
 
+@app.route('/synthesize-full', methods=['POST'])
+def synthesize_full():
+    """
+    Synthesize full text into a single WAV by concatenating paragraph audio.
+
+    Request body:
+    {
+        "text": "Full text to synthesize",
+        "voice": "alba"  # optional, defaults to "alba"
+    }
+
+    Returns: Single WAV audio file with all paragraphs concatenated.
+    """
+    data = request.get_json()
+
+    if not data or 'text' not in data:
+        return jsonify({"error": "Missing 'text' field"}), 400
+
+    text = data['text']
+    voice = data.get('voice', 'alba')
+
+    if not text.strip():
+        return jsonify({"error": "Text cannot be empty"}), 400
+
+    text = normalize_smart_quotes(text)
+
+    if voice not in AVAILABLE_VOICES:
+        voice = 'alba'
+
+    try:
+        model = get_model()
+        voice_state = get_voice_state(voice)
+        paragraphs = split_into_paragraphs(text)
+
+        print(f"Synthesizing full audio: {len(paragraphs)} paragraphs")
+
+        wav_chunks = []
+        for i, para in enumerate(paragraphs):
+            print(f"  Generating paragraph {i + 1}/{len(paragraphs)}: {para[:50]}...")
+            audio = model.generate_audio(voice_state, para)
+            wav_bytes = audio_to_wav_bytes(audio, model.sample_rate)
+            wav_chunks.append(wav_bytes)
+
+        full_wav = concatenate_wav_bytes(wav_chunks)
+
+        print(f"Full audio generated: {len(full_wav)} bytes")
+
+        return Response(
+            full_wav,
+            mimetype='audio/wav',
+            headers={
+                'Content-Disposition': 'attachment; filename=speech.wav'
+            }
+        )
+    except Exception as e:
+        print(f"Error generating full speech: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/preload', methods=['POST'])
 def preload():
     """
@@ -348,6 +445,7 @@ def main():
     print("  POST /paragraphs  - Split text into paragraphs")
     print("  POST /synthesize  - Convert text to speech")
     print("  POST /synthesize-stream - Stream text as chunked speech")
+    print("  POST /synthesize-full   - Synthesize full text as single WAV")
     print("  POST /preload     - Preload model and voices")
     print("\nServer running at http://localhost:5050")
     

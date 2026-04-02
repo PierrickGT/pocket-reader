@@ -10,10 +10,7 @@ const serverStatus = document.getElementById('server-status');
 const voiceSelect = document.getElementById('voice-select');
 const speedControl = document.getElementById('speed-control');
 const speedValue = document.getElementById('speed-value');
-const startPosition = document.getElementById('start-position');
-const readingTimeEl = document.getElementById('reading-time');
-const readingTimeValue = document.getElementById('reading-time-value');
-const btnScan = document.getElementById('btn-scan');
+
 const btnRead = document.getElementById('btn-read');
 const btnPause = document.getElementById('btn-pause');
 const btnStop = document.getElementById('btn-stop');
@@ -27,7 +24,6 @@ let isPlaying = false;
 let isPaused = false;
 let serverConnected = false;
 let currentTabId = null;
-let scannedParagraphs = [];
 
 /**
  * Initialize popup
@@ -49,8 +45,6 @@ async function init() {
   // Set up event listeners
   voiceSelect.addEventListener('change', saveVoicePreference);
   speedControl.addEventListener('input', handleSpeedChange);
-  startPosition.addEventListener('change', updateReadingTimeDisplay);
-  btnScan.addEventListener('click', handleScan);
   btnRead.addEventListener('click', handleRead);
   btnPause.addEventListener('click', handlePause);
   btnStop.addEventListener('click', handleStop);
@@ -62,11 +56,6 @@ async function init() {
   const { playing } = await chrome.storage.local.get('playing');
   if (playing) {
     setPlayingState(true);
-  }
-
-  // Auto-scan on open if server is connected
-  if (serverConnected) {
-    handleScan();
   }
 }
 
@@ -84,7 +73,6 @@ async function checkServerStatus() {
       setServerStatus('connected', 'Server connected');
       serverConnected = true;
       btnRead.disabled = false;
-      btnScan.disabled = false;
     } else {
       throw new Error('Server returned error');
     }
@@ -92,7 +80,6 @@ async function checkServerStatus() {
     setServerStatus('disconnected', 'Server offline');
     serverConnected = false;
     btnRead.disabled = true;
-    btnScan.disabled = true;
     showMessage('error', 'Server not running. Start it with: uv run server.py');
   }
 }
@@ -119,154 +106,9 @@ function handleSpeedChange() {
   const speed = parseFloat(speedControl.value);
   speedValue.textContent = `${speed.toFixed(1)}x`;
   chrome.storage.local.set({ speed: speed });
-  
-  // Update reading time estimate
-  updateReadingTimeDisplay();
-  
-  // Update current playback speed if playing
+
   if (currentTabId && isPlaying) {
     chrome.tabs.sendMessage(currentTabId, { action: 'setSpeed', speed: speed }).catch(() => {});
-  }
-}
-
-/**
- * Truncate text for display
- */
-function truncateText(text, maxLength = 50) {
-  if (text.length <= maxLength) return text;
-  return text.substring(0, maxLength - 3) + '...';
-}
-
-/**
- * Estimate reading time based on word count
- * Average TTS speed is roughly 150 words per minute at 1.0x speed
- */
-function estimateReadingTime(paragraphs, speed = 1.0) {
-  // Handle both string arrays and object arrays with {text, elementIndex}
-  const getText = (p) => typeof p === 'string' ? p : p.text;
-  const totalText = paragraphs.map(getText).join(' ');
-  const wordCount = totalText.split(/\s+/).filter(w => w.length > 0).length;
-  const wordsPerMinute = 150 * speed;
-  const minutes = wordCount / wordsPerMinute;
-  
-  if (minutes < 1) {
-    return 'Less than 1 min';
-  } else if (minutes < 60) {
-    return `~${Math.round(minutes)} min`;
-  } else {
-    const hours = Math.floor(minutes / 60);
-    const remainingMins = Math.round(minutes % 60);
-    return `~${hours}h ${remainingMins}m`;
-  }
-}
-
-/**
- * Update the reading time display based on current start position
- */
-function updateReadingTimeDisplay() {
-  if (scannedParagraphs.length === 0) {
-    readingTimeEl.classList.add('hidden');
-    return;
-  }
-  
-  const startIndex = parseInt(startPosition.value, 10) || 0;
-  const remainingParagraphs = scannedParagraphs.slice(startIndex);
-  const speed = parseFloat(speedControl.value);
-  const timeEstimate = estimateReadingTime(remainingParagraphs, speed);
-  
-  readingTimeValue.textContent = `Est. reading time: ${timeEstimate}`;
-  readingTimeEl.classList.remove('hidden');
-}
-
-/**
- * Handle Scan button click - extract and show paragraphs
- */
-async function handleScan() {
-  if (!serverConnected) {
-    showMessage('error', 'Server not connected');
-    return;
-  }
-
-  try {
-    btnScan.disabled = true;
-    btnScan.textContent = 'Scanning...';
-
-    // Get the active tab
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab) {
-      throw new Error('No active tab found');
-    }
-
-    currentTabId = tab.id;
-
-    // Ensure content script is loaded
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        files: ['content.js']
-      });
-    } catch (e) {
-      // Script might already be loaded
-    }
-
-    // Scan for readable elements (with DOM references for highlighting)
-    const response = await new Promise((resolve, reject) => {
-      chrome.tabs.sendMessage(tab.id, { action: 'scanElements' }, (resp) => {
-        if (chrome.runtime.lastError) {
-          reject(new Error('Could not access page'));
-        } else {
-          resolve(resp);
-        }
-      });
-    });
-
-    if (!response || !response.success) {
-      throw new Error(response?.error || 'Could not scan page content');
-    }
-
-    // Store paragraphs with element indices for highlighting
-    scannedParagraphs = response.paragraphs;
-
-    // Populate the dropdown
-    startPosition.innerHTML = '';
-    scannedParagraphs.forEach((para, index) => {
-      const option = document.createElement('option');
-      option.value = index;
-      const text = typeof para === 'string' ? para : para.text;
-      option.textContent = `${index + 1}. ${truncateText(text)}`;
-      startPosition.appendChild(option);
-    });
-
-    startPosition.disabled = false;
-    updateReadingTimeDisplay();
-    showMessage('success', `Found ${scannedParagraphs.length} paragraphs`);
-
-    // Check for saved reading position
-    try {
-      const savedPosition = await new Promise((resolve, reject) => {
-        chrome.tabs.sendMessage(tab.id, { action: 'getSavedPosition' }, (resp) => {
-          if (chrome.runtime.lastError) {
-            resolve(null);
-          } else {
-            resolve(resp);
-          }
-        });
-      });
-
-      if (savedPosition && savedPosition.index > 0 && savedPosition.index < scannedParagraphs.length) {
-        startPosition.value = savedPosition.index;
-        showMessage('info', `Resuming from paragraph ${savedPosition.index + 1}`);
-      }
-    } catch (e) {
-      // Ignore errors in getting saved position
-    }
-
-  } catch (error) {
-    console.error('Scan error:', error);
-    showMessage('error', error.message);
-  } finally {
-    btnScan.disabled = false;
-    btnScan.textContent = 'Scan';
   }
 }
 
@@ -303,45 +145,29 @@ async function handleRead() {
       // Script might already be loaded
     }
 
-    // Get start index
-    const startIndex = parseInt(startPosition.value, 10) || 0;
+    const voice = voiceSelect.value;
+    const speed = parseFloat(speedControl.value);
 
-    // If we have scanned paragraphs, use them directly
-    if (scannedParagraphs.length > 0) {
-      const voice = voiceSelect.value;
-      const speed = parseFloat(speedControl.value);
+    chrome.tabs.sendMessage(tab.id, { action: 'extractContent' }, (response) => {
+      if (chrome.runtime.lastError) {
+        showMessage('error', 'Could not access page content');
+        setPlayingState(false);
+        return;
+      }
+
+      if (!response || !response.text) {
+        showMessage('error', 'Could not extract page content');
+        setPlayingState(false);
+        return;
+      }
+
       chrome.tabs.sendMessage(tab.id, {
-        action: 'readParagraphs',
-        paragraphs: scannedParagraphs,
-        startIndex: startIndex,
+        action: 'readText',
+        text: response.text,
         voice: voice,
         speed: speed
       });
-    } else {
-      // Otherwise extract and read from beginning
-      chrome.tabs.sendMessage(tab.id, { action: 'extractContent' }, (response) => {
-        if (chrome.runtime.lastError) {
-          showMessage('error', 'Could not access page content');
-          setPlayingState(false);
-          return;
-        }
-
-        if (!response || !response.text) {
-          showMessage('error', 'Could not extract page content');
-          setPlayingState(false);
-          return;
-        }
-
-        const voice = voiceSelect.value;
-        const speed = parseFloat(speedControl.value);
-        chrome.tabs.sendMessage(tab.id, {
-          action: 'readText',
-          text: response.text,
-          voice: voice,
-          speed: speed
-        });
-      });
-    }
+    });
   } catch (error) {
     console.error('Error starting read:', error);
     showMessage('error', error.message);
@@ -387,20 +213,18 @@ function handleContentMessage(message, sender) {
   if (!sender.tab) return;
 
   switch (message.action) {
+    case 'compiling':
+      setPlayingState(true);
+      updateProgress(5, 'Compiling audio...');
+      break;
+
     case 'progress':
       updateProgress(message.percent, message.text);
       break;
 
     case 'playing':
       setPlayingState(true);
-      if (message.total && message.total > 1) {
-        updateProgress(
-          10 + Math.floor((message.current / message.total) * 80),
-          `Playing ${message.current}/${message.total}...`
-        );
-      } else {
-        updateProgress(100, 'Playing audio...');
-      }
+      updateProgress(10, 'Playing audio...');
       break;
 
     case 'stopped':
@@ -438,8 +262,6 @@ function setPlayingState(playing) {
   btnRead.disabled = playing || !serverConnected;
   btnPause.disabled = !playing;
   btnStop.disabled = !playing;
-  btnScan.disabled = playing;
-  startPosition.disabled = playing || scannedParagraphs.length === 0;
 
   if (playing) {
     progressContainer.classList.remove('hidden');
@@ -455,7 +277,7 @@ function setPausedState(paused) {
   isPaused = paused;
   const pauseIcon = btnPause.querySelector('.icon');
   const pauseText = btnPause.childNodes[btnPause.childNodes.length - 1];
-  
+
   if (paused) {
     pauseIcon.className = 'icon icon-play';
     pauseText.textContent = 'Resume';
