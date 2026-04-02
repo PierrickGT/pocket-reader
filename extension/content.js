@@ -103,6 +103,7 @@ function removeHighlight() {
 function findContentContainer() {
   const selectors = [
     '[data-testid="twitterArticleReadView"]',
+    '[data-testid="tweet"]',
     'article',
     '[role="main"]',
     'main',
@@ -179,7 +180,7 @@ function extractReadableElements() {
 
   // Selectors for readable content blocks
   const readableSelectors =
-    '[data-testid="twitter-article-title"], [data-text="true"], p, h1, h2, h3, h4, h5, h6, li, blockquote, figcaption, td, th, dt, dd, pre';
+    '[data-testid="twitter-article-title"], [data-testid="tweetText"], [data-text="true"], p, h1, h2, h3, h4, h5, h6, li, blockquote, figcaption, td, th, dt, dd, pre';
 
   const candidates = container.querySelectorAll(readableSelectors);
 
@@ -941,12 +942,7 @@ async function speakSelection(voice, speed) {
       });
     };
 
-    const streamTask = streamSelectionAudio(
-      selectedText,
-      voice,
-      enqueueChunk,
-      selectionStreamAbortController.signal
-    )
+    const streamTask = streamSelectionAudio(selectedText, voice, enqueueChunk, selectionStreamAbortController.signal)
       .catch((error) => {
         streamError = error;
       })
